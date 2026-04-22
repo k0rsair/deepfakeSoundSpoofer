@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 
 from deepfake_spoofer.data import ID_TO_LABEL, load_audio
-from deepfake_spoofer.model import Wav2VecPyAraSpoofDetector
+from deepfake_spoofer.model import build_spoof_detector
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,9 +18,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_model_from_checkpoint(checkpoint: dict, device: torch.device) -> Wav2VecPyAraSpoofDetector:
+def build_model_from_checkpoint(checkpoint: dict, device: torch.device) -> torch.nn.Module:
     config = checkpoint.get("config", {})
-    model = Wav2VecPyAraSpoofDetector(
+    model = build_spoof_detector(
+        model_type=config.get("model_type", "wav2vec_pyara"),
         bundle_name=config.get("bundle", "WAV2VEC2_XLSR_300M"),
         freeze_wav2vec=True,
         freeze_feature_extractor=not config.get("unfreeze_feature_extractor", False),
@@ -43,14 +44,14 @@ def main() -> None:
 
     with torch.no_grad():
         for audio_path in args.audio:
-            waveform, length = load_audio(
+            audio = load_audio(
                 Path(audio_path),
                 sample_rate=sample_rate,
                 max_samples=max_samples,
                 random_crop=False,
             )
-            waveforms = waveform.unsqueeze(0).to(device)
-            lengths = torch.tensor([length], dtype=torch.long, device=device)
+            waveforms = audio.waveform.unsqueeze(0).to(device)
+            lengths = torch.tensor([audio.valid_length], dtype=torch.long, device=device)
             _, logits = model(waveforms, lengths)
             probs = torch.softmax(logits, dim=1).squeeze(0)
             pred_id = int(probs.argmax().item())
