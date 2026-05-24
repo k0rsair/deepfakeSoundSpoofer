@@ -41,6 +41,29 @@ class AudioLoadResult:
     original_length: int
 
 
+def compute_crop_window(
+    raw_num_samples: int,
+    *,
+    max_samples: int | None,
+    random_crop: bool,
+    crop_start: int | None = None,
+) -> tuple[int, int]:
+    valid_length = raw_num_samples
+    chosen_crop_start = 0
+
+    if max_samples is not None and raw_num_samples > max_samples:
+        if crop_start is not None:
+            start = min(max(crop_start, 0), raw_num_samples - max_samples)
+        elif random_crop:
+            start = random.randint(0, raw_num_samples - max_samples)
+        else:
+            start = max((raw_num_samples - max_samples) // 2, 0)
+        chosen_crop_start = start
+        valid_length = max_samples
+
+    return valid_length, chosen_crop_start
+
+
 def protocol_for_split(data_dir: Path, split: str) -> Path:
     try:
         protocol_name = DEFAULT_PROTOCOLS[split]
@@ -170,7 +193,13 @@ def wav2vec_cache_path(cache_dir: str | Path, split: str, file_id: str) -> Path:
     return cache_root / split / shard / f"{file_id}.pt"
 
 
-def crop_cached_ssl_features(
+def mfcc_cache_path(cache_dir: str | Path, split: str, file_id: str) -> Path:
+    cache_root = Path(cache_dir)
+    shard = file_id[2:5]
+    return cache_root / split / shard / f"{file_id}.pt"
+
+
+def crop_cached_frame_features(
     cached_features: torch.Tensor,
     *,
     raw_num_samples: int,
@@ -193,6 +222,27 @@ def crop_cached_ssl_features(
     return sliced, int(sliced.size(0))
 
 
+def crop_cached_ssl_features(
+    cached_features: torch.Tensor,
+    *,
+    raw_num_samples: int,
+    crop_start: int,
+    crop_num_samples: int,
+) -> tuple[torch.Tensor, int]:
+    return crop_cached_frame_features(
+        cached_features,
+        raw_num_samples=raw_num_samples,
+        crop_start=crop_start,
+        crop_num_samples=crop_num_samples,
+    )
+
+
+def expected_mfcc_frames(num_samples: int, *, hop_length: int) -> int:
+    if num_samples <= 0:
+        return 1
+    return max(int(num_samples // hop_length) + 1, 1)
+
+
 class ASVspoof5Dataset(Dataset):
     def __init__(
         self,
@@ -206,6 +256,8 @@ class ASVspoof5Dataset(Dataset):
         limit: int | None = None,
         limit_per_class: int | None = None,
         ssl_cache_dir: str | Path | None = None,
+        mfcc_cache_dir: str | Path | None = None,
+        load_waveform: bool = True,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.split = split
@@ -213,6 +265,8 @@ class ASVspoof5Dataset(Dataset):
         self.max_samples = int(max_seconds * sample_rate) if max_seconds > 0 else None
         self.random_crop = random_crop
         self.ssl_cache_dir = Path(ssl_cache_dir) if ssl_cache_dir else None
+        self.mfcc_cache_dir = Path(mfcc_cache_dir) if mfcc_cache_dir else None
+        self.load_waveform = load_waveform
         self.items = read_asvspoof5_protocol(
             self.data_dir,
             split,
@@ -230,50 +284,111 @@ class ASVspoof5Dataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, object]:
         item = self.items[index]
-        audio = load_audio(
-            item.path,
-            sample_rate=self.sample_rate,
-            max_samples=self.max_samples,
-            random_crop=self.random_crop,
-        )
         ssl_features = None
         ssl_length = None
+        mfcc_features = None
+        mfcc_length = None
+        ssl_payload = None
+        mfcc_payload = None
+        raw_num_samples = None
         if self.ssl_cache_dir is not None:
             cache_path = wav2vec_cache_path(self.ssl_cache_dir, self.split, item.file_id)
             if not cache_path.exists():
                 raise FileNotFoundError(f"Missing wav2vec cache for {item.file_id}: {cache_path}")
-            payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-            cached_features = payload["features"].float()
-            raw_num_samples = int(payload["raw_num_samples"])
+            ssl_payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+            raw_num_samples = int(ssl_payload["raw_num_samples"])
+        if self.mfcc_cache_dir is not None:
+            cache_path = mfcc_cache_path(self.mfcc_cache_dir, self.split, item.file_id)
+            if not cache_path.exists():
+                raise FileNotFoundError(f"Missing MFCC cache for {item.file_id}: {cache_path}")
+            mfcc_payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+            if raw_num_samples is None:
+                raw_num_samples = int(mfcc_payload["raw_num_samples"])
+
+        if self.load_waveform:
+            audio = load_audio(
+                item.path,
+                sample_rate=self.sample_rate,
+                max_samples=self.max_samples,
+                random_crop=self.random_crop,
+            )
+            waveform = audio.waveform
+            valid_length = audio.valid_length
+            crop_start = audio.crop_start
+        else:
+            if raw_num_samples is None:
+                raise ValueError("A cache with raw_num_samples metadata is required when load_waveform=False")
+            valid_length, crop_start = compute_crop_window(
+                raw_num_samples,
+                max_samples=self.max_samples,
+                random_crop=self.random_crop,
+            )
+            waveform = None
+
+        if self.ssl_cache_dir is not None:
+            assert ssl_payload is not None
+            cached_features = ssl_payload["features"].float()
+            current_raw_num_samples = int(ssl_payload["raw_num_samples"])
             if self.max_samples is None:
                 ssl_features = cached_features
                 ssl_length = int(cached_features.size(0))
             else:
                 ssl_features, ssl_length = crop_cached_ssl_features(
                     cached_features,
-                    raw_num_samples=raw_num_samples,
-                    crop_start=audio.crop_start,
-                    crop_num_samples=min(self.max_samples, raw_num_samples),
+                    raw_num_samples=current_raw_num_samples,
+                    crop_start=crop_start,
+                    crop_num_samples=min(self.max_samples, current_raw_num_samples),
                 )
+        if self.mfcc_cache_dir is not None:
+            assert mfcc_payload is not None
+            cached_features = mfcc_payload["features"].float()
+            current_raw_num_samples = int(mfcc_payload["raw_num_samples"])
+            hop_length = int(mfcc_payload.get("hop_length", int(0.010 * self.sample_rate)))
+            if self.max_samples is None:
+                mfcc_features = cached_features
+                mfcc_length = int(cached_features.size(0))
+            else:
+                mfcc_features, mfcc_length = crop_cached_frame_features(
+                    cached_features,
+                    raw_num_samples=current_raw_num_samples,
+                    crop_start=crop_start,
+                    crop_num_samples=min(self.max_samples, current_raw_num_samples),
+                )
+                target_frames = expected_mfcc_frames(self.max_samples, hop_length=hop_length)
+                current_frames = int(mfcc_features.size(0))
+                if current_frames < target_frames:
+                    mfcc_features = torch.nn.functional.pad(mfcc_features, (0, 0, 0, target_frames - current_frames))
+                elif current_frames > target_frames:
+                    mfcc_features = mfcc_features[:target_frames]
+                mfcc_length = target_frames
         return {
-            "waveform": audio.waveform,
-            "length": audio.valid_length,
+            "waveform": waveform,
+            "length": valid_length,
             "label": item.label,
             "path": str(item.path),
             "file_id": item.file_id,
             "ssl_features": ssl_features,
             "ssl_length": ssl_length,
+            "mfcc_features": mfcc_features,
+            "mfcc_length": mfcc_length,
         }
 
 
 def collate_audio(batch: Iterable[dict[str, object]]) -> dict[str, object]:
     rows = list(batch)
-    waveforms = pad_sequence([row["waveform"] for row in rows], batch_first=True)
+    waveforms = None
+    if all(row.get("waveform") is not None for row in rows):
+        waveforms = pad_sequence([row["waveform"] for row in rows], batch_first=True)
     ssl_features = None
     ssl_lengths = None
+    mfcc_features = None
+    mfcc_lengths = None
     if all(row.get("ssl_features") is not None for row in rows):
         ssl_features = pad_sequence([row["ssl_features"] for row in rows], batch_first=True)
         ssl_lengths = torch.tensor([row["ssl_length"] for row in rows], dtype=torch.long)
+    if all(row.get("mfcc_features") is not None for row in rows):
+        mfcc_features = pad_sequence([row["mfcc_features"] for row in rows], batch_first=True)
+        mfcc_lengths = torch.tensor([row["mfcc_length"] for row in rows], dtype=torch.long)
     return {
         "waveforms": waveforms,
         "lengths": torch.tensor([row["length"] for row in rows], dtype=torch.long),
@@ -282,6 +397,8 @@ def collate_audio(batch: Iterable[dict[str, object]]) -> dict[str, object]:
         "file_ids": [row["file_id"] for row in rows],
         "ssl_features": ssl_features,
         "ssl_lengths": ssl_lengths,
+        "mfcc_features": mfcc_features,
+        "mfcc_lengths": mfcc_lengths,
     }
 
 

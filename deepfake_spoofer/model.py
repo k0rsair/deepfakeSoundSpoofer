@@ -106,6 +106,132 @@ class Wav2VecFrontend(nn.Module):
         return features[-1], feature_lengths
 
 
+def lengths_to_mask(lengths: Tensor, max_length: int, *, device: torch.device | None = None) -> Tensor:
+    if device is None:
+        device = lengths.device
+    safe_lengths = lengths.to(device=device, dtype=torch.long).clamp_min(1).clamp_max(max_length)
+    positions = torch.arange(max_length, device=device).unsqueeze(0)
+    return positions < safe_lengths.unsqueeze(1)
+
+
+class TemporalConvBlock(nn.Module):
+    def __init__(self, dim: int, *, kernel_size: int = 5, dilation: int = 1, dropout: float = 0.1) -> None:
+        super().__init__()
+        padding = ((kernel_size - 1) // 2) * dilation
+        self.depthwise = nn.Conv1d(
+            dim,
+            dim,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+            groups=dim,
+            bias=False,
+        )
+        self.norm = nn.GroupNorm(1, dim)
+        self.pointwise1 = nn.Conv1d(dim, dim * 2, kernel_size=1)
+        self.pointwise2 = nn.Conv1d(dim * 2, dim, kernel_size=1)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
+        residual = x
+        out = self.depthwise(x)
+        out = self.norm(out)
+        out = self.act(out)
+        out = self.pointwise1(out)
+        out = self.act(out)
+        out = self.drop(out)
+        out = self.pointwise2(out)
+        out = self.drop(out)
+        out = out + residual
+        if mask is not None:
+            out = out * mask.unsqueeze(1).to(dtype=out.dtype)
+        return out
+
+
+class AttentiveStatisticsPool(nn.Module):
+    def __init__(self, input_dim: int, *, hidden_dim: int | None = None, eps: float = 1e-5) -> None:
+        super().__init__()
+        attention_dim = hidden_dim or input_dim
+        self.attention = nn.Sequential(
+            nn.Linear(input_dim, attention_dim),
+            nn.Tanh(),
+            nn.Linear(attention_dim, 1),
+        )
+        self.eps = eps
+
+    def forward(self, x: Tensor, lengths: Tensor | None = None) -> Tensor:
+        if lengths is None:
+            lengths = torch.full((x.size(0),), x.size(1), dtype=torch.long, device=x.device)
+        else:
+            lengths = lengths.to(device=x.device, dtype=torch.long).clamp_min(1).clamp_max(x.size(1))
+
+        mask = lengths_to_mask(lengths, x.size(1), device=x.device)
+        scores = self.attention(x).squeeze(-1)
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        weights = F.softmax(scores, dim=1).unsqueeze(-1)
+        mean = torch.sum(weights * x, dim=1)
+        second_moment = torch.sum(weights * x.square(), dim=1)
+        std = (second_moment - mean.square()).clamp_min(self.eps).sqrt()
+        return torch.cat([mean, std], dim=1)
+
+
+class Wav2VecTemporalHead(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        model_dim: int = 256,
+        embedding_dim: int = 160,
+        num_blocks: int = 4,
+        dropout: float = 0.2,
+        num_classes: int = 2,
+    ) -> None:
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, model_dim)
+        self.input_norm = nn.LayerNorm(model_dim)
+        self.input_drop = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList(
+            TemporalConvBlock(
+                model_dim,
+                kernel_size=5,
+                dilation=2 ** (block_index % 3),
+                dropout=dropout,
+            )
+            for block_index in range(num_blocks)
+        )
+        self.pool = AttentiveStatisticsPool(model_dim, hidden_dim=model_dim)
+        self.embedding_proj = nn.Sequential(
+            nn.LayerNorm(model_dim * 2),
+            nn.Dropout(0.3),
+            nn.Linear(model_dim * 2, embedding_dim),
+            nn.GELU(),
+        )
+        self.output_drop = nn.Dropout(0.3)
+        self.classifier = nn.Linear(embedding_dim, num_classes)
+
+    def forward(self, features: Tensor, lengths: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        if lengths is None:
+            lengths = torch.full((features.size(0),), features.size(1), dtype=torch.long, device=features.device)
+        else:
+            lengths = lengths.to(device=features.device, dtype=torch.long).clamp_min(1).clamp_max(features.size(1))
+
+        mask = lengths_to_mask(lengths, features.size(1), device=features.device)
+        x = self.input_proj(features)
+        x = self.input_norm(x)
+        x = F.gelu(x)
+        x = self.input_drop(x)
+        x = x * mask.unsqueeze(-1).to(dtype=x.dtype)
+        x = x.transpose(1, 2)
+        for block in self.blocks:
+            x = block(x, mask)
+        x = x.transpose(1, 2)
+        pooled = self.pool(x, lengths)
+        embedding = self.embedding_proj(pooled)
+        logits = self.classifier(self.output_drop(embedding))
+        return embedding, logits
+
+
 class GraphAttentionLayer(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, *, temperature: float = 1.0) -> None:
         super().__init__()
@@ -287,6 +413,33 @@ class MFCCResNetBlock(nn.Module):
         return out + residual
 
 
+def build_mfcc_transform(
+    *,
+    sample_rate: int = 16_000,
+    n_mfcc: int = 40,
+    n_mels: int = 64,
+) -> nn.Module:
+    import torchaudio
+
+    return torchaudio.transforms.MFCC(
+        sample_rate=sample_rate,
+        n_mfcc=n_mfcc,
+        melkwargs={
+            "n_fft": int(0.025 * sample_rate),
+            "hop_length": int(0.010 * sample_rate),
+            "n_mels": n_mels,
+            "center": True,
+            "power": 2.0,
+        },
+    )
+
+
+def normalize_mfcc_features(mfcc: Tensor) -> Tensor:
+    mean = mfcc.mean(dim=(-1, -2), keepdim=True)
+    std = mfcc.std(dim=(-1, -2), keepdim=True).clamp_min(1e-5)
+    return (mfcc - mean) / std
+
+
 class MFCCResNetBranch(nn.Module):
     """PyAra MFCC/ResNet branch that exposes the 128-d embedding before fc2."""
 
@@ -300,20 +453,10 @@ class MFCCResNetBranch(nn.Module):
         num_classes: int = 2,
     ) -> None:
         super().__init__()
-        import torchaudio
-
         self.sample_rate = sample_rate
-        self.mfcc = torchaudio.transforms.MFCC(
-            sample_rate=sample_rate,
-            n_mfcc=n_mfcc,
-            melkwargs={
-                "n_fft": int(0.025 * sample_rate),
-                "hop_length": int(0.010 * sample_rate),
-                "n_mels": n_mels,
-                "center": True,
-                "power": 2.0,
-            },
-        )
+        self.n_mfcc = n_mfcc
+        self.n_mels = n_mels
+        self.mfcc = build_mfcc_transform(sample_rate=sample_rate, n_mfcc=n_mfcc, n_mels=n_mels)
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
         self.block1 = MFCCResNetBlock(32, 32, first=True)
         self.block2 = MFCCResNetBlock(32, 32)
@@ -332,9 +475,21 @@ class MFCCResNetBranch(nn.Module):
         self.fc1 = nn.Linear(32, embedding_dim)
         self.fc2 = nn.Linear(embedding_dim, num_classes)
 
-    def forward(self, waveforms: Tensor, lengths: Tensor | None = None) -> tuple[Tensor, Tensor]:
-        del lengths
-        x = self._extract_mfcc(waveforms)
+    def forward(
+        self,
+        waveforms: Tensor | None,
+        lengths: Tensor | None = None,
+        *,
+        mfcc_features: Tensor | None = None,
+        mfcc_feature_lengths: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        del lengths, mfcc_feature_lengths
+        if mfcc_features is None:
+            if waveforms is None:
+                raise ValueError("waveforms are required when mfcc_features are not provided")
+            x = self._extract_mfcc(waveforms)
+        else:
+            x = self._prepare_cached_mfcc(mfcc_features)
         x = x.unsqueeze(dim=1)
         x = self.conv1(x)
         x = self.block1(x)
@@ -358,9 +513,13 @@ class MFCCResNetBranch(nn.Module):
     def _extract_mfcc(self, waveforms: Tensor) -> Tensor:
         x = waveforms.float()
         mfcc = self.mfcc(x)
-        mean = mfcc.mean(dim=(-1, -2), keepdim=True)
-        std = mfcc.std(dim=(-1, -2), keepdim=True).clamp_min(1e-5)
-        return (mfcc - mean) / std
+        return normalize_mfcc_features(mfcc)
+
+    def _prepare_cached_mfcc(self, mfcc_features: Tensor) -> Tensor:
+        if mfcc_features.ndim == 2:
+            mfcc_features = mfcc_features.unsqueeze(0)
+        x = mfcc_features.float().transpose(1, 2)
+        return normalize_mfcc_features(x)
 
 
 class PyAraAASISTHead(nn.Module):
@@ -501,8 +660,10 @@ class Wav2VecPyAraSpoofDetector(nn.Module):
         *,
         ssl_features: Tensor | None = None,
         ssl_feature_lengths: Tensor | None = None,
+        mfcc_features: Tensor | None = None,
+        mfcc_feature_lengths: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        del ssl_feature_lengths
+        del ssl_feature_lengths, mfcc_features, mfcc_feature_lengths
         if ssl_features is None:
             if waveforms is None:
                 raise ValueError("waveforms are required when ssl_features are not provided")
@@ -510,6 +671,59 @@ class Wav2VecPyAraSpoofDetector(nn.Module):
         else:
             features = ssl_features
         return self.head(features)
+
+
+class Wav2VecTemporalSpoofDetector(nn.Module):
+    def __init__(
+        self,
+        bundle_name: str = "WAV2VEC2_XLSR_300M",
+        *,
+        freeze_wav2vec: bool = False,
+        freeze_feature_extractor: bool = True,
+        freeze_transformer_layers: int = 0,
+        wav2vec_layers: int | None = None,
+        temporal_dim: int = 256,
+        embedding_dim: int = 160,
+        num_classes: int = 2,
+    ) -> None:
+        super().__init__()
+        self.frontend = Wav2VecFrontend(
+            bundle_name=bundle_name,
+            freeze_wav2vec=freeze_wav2vec,
+            freeze_feature_extractor=freeze_feature_extractor,
+            freeze_transformer_layers=freeze_transformer_layers,
+            wav2vec_layers=wav2vec_layers,
+        )
+        self.head = Wav2VecTemporalHead(
+            input_dim=self.frontend.out_dim,
+            model_dim=temporal_dim,
+            embedding_dim=embedding_dim,
+            num_classes=num_classes,
+        )
+
+    @property
+    def sample_rate(self) -> int:
+        return self.frontend.sample_rate
+
+    def forward(
+        self,
+        waveforms: Tensor | None,
+        lengths: Tensor | None = None,
+        *,
+        ssl_features: Tensor | None = None,
+        ssl_feature_lengths: Tensor | None = None,
+        mfcc_features: Tensor | None = None,
+        mfcc_feature_lengths: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        del mfcc_features, mfcc_feature_lengths
+        if ssl_features is None:
+            if waveforms is None:
+                raise ValueError("waveforms are required when ssl_features are not provided")
+            features, feature_lengths = self.frontend(waveforms, lengths)
+        else:
+            features = ssl_features
+            feature_lengths = ssl_feature_lengths
+        return self.head(features, feature_lengths)
 
 
 class MFCCResNetSpoofDetector(nn.Module):
@@ -528,14 +742,21 @@ class MFCCResNetSpoofDetector(nn.Module):
 
     def forward(
         self,
-        waveforms: Tensor,
+        waveforms: Tensor | None,
         lengths: Tensor | None = None,
         *,
         ssl_features: Tensor | None = None,
         ssl_feature_lengths: Tensor | None = None,
+        mfcc_features: Tensor | None = None,
+        mfcc_feature_lengths: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         del ssl_features, ssl_feature_lengths
-        return self.branch(waveforms, lengths)
+        return self.branch(
+            waveforms,
+            lengths,
+            mfcc_features=mfcc_features,
+            mfcc_feature_lengths=mfcc_feature_lengths,
+        )
 
 
 class FusionSpoofDetector(nn.Module):
@@ -582,6 +803,8 @@ class FusionSpoofDetector(nn.Module):
         *,
         ssl_features: Tensor | None = None,
         ssl_feature_lengths: Tensor | None = None,
+        mfcc_features: Tensor | None = None,
+        mfcc_feature_lengths: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         wav_embedding, _ = self.wav2vec_branch(
             waveforms,
@@ -589,7 +812,78 @@ class FusionSpoofDetector(nn.Module):
             ssl_features=ssl_features,
             ssl_feature_lengths=ssl_feature_lengths,
         )
-        mfcc_embedding, _ = self.mfcc_branch(waveforms, lengths)
+        mfcc_embedding, _ = self.mfcc_branch(
+            waveforms,
+            lengths,
+            mfcc_features=mfcc_features,
+            mfcc_feature_lengths=mfcc_feature_lengths,
+        )
+        embedding = torch.cat([wav_embedding, mfcc_embedding], dim=1)
+        logits = self.fusion_classifier(embedding)
+        return embedding, logits
+
+
+class FusionTemporalSpoofDetector(nn.Module):
+    def __init__(
+        self,
+        bundle_name: str = "WAV2VEC2_XLSR_300M",
+        *,
+        freeze_wav2vec: bool = False,
+        freeze_feature_extractor: bool = True,
+        freeze_transformer_layers: int = 0,
+        wav2vec_layers: int | None = None,
+        temporal_dim: int = 256,
+        temporal_embedding_dim: int = 160,
+        fusion_hidden_dim: int = 128,
+        num_classes: int = 2,
+    ) -> None:
+        super().__init__()
+        self.wav2vec_branch = Wav2VecTemporalSpoofDetector(
+            bundle_name=bundle_name,
+            freeze_wav2vec=freeze_wav2vec,
+            freeze_feature_extractor=freeze_feature_extractor,
+            freeze_transformer_layers=freeze_transformer_layers,
+            wav2vec_layers=wav2vec_layers,
+            temporal_dim=temporal_dim,
+            embedding_dim=temporal_embedding_dim,
+            num_classes=num_classes,
+        )
+        self.mfcc_branch = MFCCResNetBranch(sample_rate=self.wav2vec_branch.sample_rate, num_classes=num_classes)
+        self.embedding_dim = temporal_embedding_dim + 128
+        self.fusion_classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(self.embedding_dim, fusion_hidden_dim),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(fusion_hidden_dim, num_classes),
+        )
+
+    @property
+    def sample_rate(self) -> int:
+        return self.wav2vec_branch.sample_rate
+
+    def forward(
+        self,
+        waveforms: Tensor,
+        lengths: Tensor | None = None,
+        *,
+        ssl_features: Tensor | None = None,
+        ssl_feature_lengths: Tensor | None = None,
+        mfcc_features: Tensor | None = None,
+        mfcc_feature_lengths: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        wav_embedding, _ = self.wav2vec_branch(
+            waveforms,
+            lengths,
+            ssl_features=ssl_features,
+            ssl_feature_lengths=ssl_feature_lengths,
+        )
+        mfcc_embedding, _ = self.mfcc_branch(
+            waveforms,
+            lengths,
+            mfcc_features=mfcc_features,
+            mfcc_feature_lengths=mfcc_feature_lengths,
+        )
         embedding = torch.cat([wav_embedding, mfcc_embedding], dim=1)
         logits = self.fusion_classifier(embedding)
         return embedding, logits
@@ -614,6 +908,15 @@ def build_spoof_detector(
             wav2vec_layers=wav2vec_layers,
             num_classes=num_classes,
         )
+    if model_type == "wav2vec_temporal":
+        return Wav2VecTemporalSpoofDetector(
+            bundle_name=bundle_name,
+            freeze_wav2vec=freeze_wav2vec,
+            freeze_feature_extractor=freeze_feature_extractor,
+            freeze_transformer_layers=freeze_transformer_layers,
+            wav2vec_layers=wav2vec_layers,
+            num_classes=num_classes,
+        )
     if model_type == "mfcc_resnet":
         return MFCCResNetSpoofDetector(num_classes=num_classes)
     if model_type == "fusion":
@@ -625,4 +928,15 @@ def build_spoof_detector(
             wav2vec_layers=wav2vec_layers,
             num_classes=num_classes,
         )
-    raise ValueError("model_type must be one of: fusion, wav2vec_pyara, mfcc_resnet")
+    if model_type == "fusion_temporal":
+        return FusionTemporalSpoofDetector(
+            bundle_name=bundle_name,
+            freeze_wav2vec=freeze_wav2vec,
+            freeze_feature_extractor=freeze_feature_extractor,
+            freeze_transformer_layers=freeze_transformer_layers,
+            wav2vec_layers=wav2vec_layers,
+            num_classes=num_classes,
+        )
+    raise ValueError(
+        "model_type must be one of: fusion, fusion_temporal, wav2vec_pyara, wav2vec_temporal, mfcc_resnet"
+    )

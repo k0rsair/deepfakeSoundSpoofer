@@ -55,21 +55,44 @@ class TrainableEMA:
         self.backup = {}
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train wav2vec + PyAra/AASIST-style deepfake audio detector.")
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "decay": self.decay,
+            "shadow": {name: tensor.detach().clone() for name, tensor in self.shadow.items()},
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any] | None, device: torch.device) -> None:
+        if not state_dict:
+            return
+        self.decay = float(state_dict.get("decay", self.decay))
+        updated_shadow = dict(self.shadow)
+        for name, tensor in state_dict.get("shadow", {}).items():
+            if name in updated_shadow:
+                updated_shadow[name] = tensor.detach().clone().to(device)
+        self.shadow = updated_shadow
+        self.backup = {}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train deepfake audio detector variants based on wav2vec and MFCC.")
     parser.add_argument("--data-dir", default="data", help="Folder with ASVspoof5 TSV files and flac_* folders.")
     parser.add_argument("--output-dir", default="runs/wav2vec_pyara", help="Where checkpoints and logs are written.")
     parser.add_argument(
         "--model-type",
         default="fusion",
-        choices=["fusion", "wav2vec_pyara", "mfcc_resnet"],
-        help="fusion joins wav2vec/PyAra and MFCC/ResNet embeddings.",
+        choices=["fusion", "fusion_temporal", "wav2vec_pyara", "wav2vec_temporal", "mfcc_resnet"],
+        help="Choose PyAra-style or temporal wav2vec heads, with or without MFCC/ResNet fusion.",
     )
     parser.add_argument("--bundle", default="WAV2VEC2_XLSR_300M", help="torchaudio wav2vec bundle name.")
     parser.add_argument(
         "--wav2vec-cache-dir",
         default=None,
         help="Optional path to precomputed frozen wav2vec features for the selected layer.",
+    )
+    parser.add_argument(
+        "--mfcc-cache-dir",
+        default=None,
+        help="Optional path to precomputed MFCC features for MFCC-based model branches.",
     )
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -101,7 +124,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-min-epochs", type=int, default=3)
     parser.add_argument("--best-metric", default="roc_auc", choices=["roc_auc", "loss"])
     parser.add_argument("--mixed-precision", action=argparse.BooleanOptionalAction, default=True)
-    return parser.parse_args()
+    parser.add_argument("--resume-from", default=None, help="Resume training from a saved last.pt checkpoint.")
+    return parser
+
+
+def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
+    parser = build_parser()
+    return parser.parse_args(), parser
 
 
 def seed_everything(seed: int) -> None:
@@ -111,10 +140,38 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def needs_waveforms(
+    model_type: str,
+    *,
+    ssl_cache_dir: str | Path | None,
+    mfcc_cache_dir: str | Path | None,
+) -> bool:
+    if model_type == "mfcc_resnet":
+        return mfcc_cache_dir is None
+    if model_type in {"wav2vec_pyara", "wav2vec_temporal"}:
+        return ssl_cache_dir is None
+    if model_type in {"fusion", "fusion_temporal"}:
+        return ssl_cache_dir is None or mfcc_cache_dir is None
+    return True
+
+
 def make_loaders(args: argparse.Namespace) -> tuple[ASVspoof5Dataset, ASVspoof5Dataset, DataLoader, DataLoader]:
     ssl_cache_dir = None
-    if args.freeze_wav2vec and args.wav2vec_cache_dir and args.model_type in {"fusion", "wav2vec_pyara"}:
+    mfcc_cache_dir = None
+    if args.freeze_wav2vec and args.wav2vec_cache_dir and args.model_type in {
+        "fusion",
+        "fusion_temporal",
+        "wav2vec_pyara",
+        "wav2vec_temporal",
+    }:
         ssl_cache_dir = args.wav2vec_cache_dir
+    if args.mfcc_cache_dir and args.model_type in {"fusion", "fusion_temporal", "mfcc_resnet"}:
+        mfcc_cache_dir = args.mfcc_cache_dir
+    load_waveform = needs_waveforms(
+        args.model_type,
+        ssl_cache_dir=ssl_cache_dir,
+        mfcc_cache_dir=mfcc_cache_dir,
+    )
 
     train_dataset = ASVspoof5Dataset(
         args.data_dir,
@@ -125,6 +182,8 @@ def make_loaders(args: argparse.Namespace) -> tuple[ASVspoof5Dataset, ASVspoof5D
         limit=args.limit_train,
         limit_per_class=args.limit_per_class,
         ssl_cache_dir=ssl_cache_dir,
+        mfcc_cache_dir=mfcc_cache_dir,
+        load_waveform=load_waveform,
     )
     dev_dataset = ASVspoof5Dataset(
         args.data_dir,
@@ -135,6 +194,8 @@ def make_loaders(args: argparse.Namespace) -> tuple[ASVspoof5Dataset, ASVspoof5D
         limit=args.limit_dev,
         limit_per_class=args.limit_per_class,
         ssl_cache_dir=ssl_cache_dir,
+        mfcc_cache_dir=mfcc_cache_dir,
+        load_waveform=load_waveform,
     )
 
     sampler = None if args.no_balanced_sampler else make_balanced_sampler(train_dataset)
@@ -160,7 +221,11 @@ def make_loaders(args: argparse.Namespace) -> tuple[ASVspoof5Dataset, ASVspoof5D
 
 
 def validate_wav2vec_cache(args: argparse.Namespace) -> None:
-    if not (args.freeze_wav2vec and args.wav2vec_cache_dir and args.model_type in {"fusion", "wav2vec_pyara"}):
+    if not (
+        args.freeze_wav2vec
+        and args.wav2vec_cache_dir
+        and args.model_type in {"fusion", "fusion_temporal", "wav2vec_pyara", "wav2vec_temporal"}
+    ):
         return
 
     meta_path = Path(args.wav2vec_cache_dir) / "meta.json"
@@ -178,6 +243,26 @@ def validate_wav2vec_cache(args: argparse.Namespace) -> None:
         raise ValueError(
             f"wav2vec cache layer mismatch: cache has layer {cached_layers}, train requested {args.wav2vec_layers}"
         )
+
+
+def validate_mfcc_cache(args: argparse.Namespace) -> None:
+    if not (args.mfcc_cache_dir and args.model_type in {"fusion", "fusion_temporal", "mfcc_resnet"}):
+        return
+
+    meta_path = Path(args.mfcc_cache_dir) / "meta.json"
+    if not meta_path.exists():
+        return
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    cached_sample_rate = meta.get("sample_rate")
+    cached_n_mfcc = meta.get("n_mfcc")
+    cached_n_mels = meta.get("n_mels")
+    if cached_sample_rate is not None and int(cached_sample_rate) != 16_000:
+        raise ValueError(f"MFCC cache sample rate mismatch: cache has {cached_sample_rate}, train expects 16000")
+    if cached_n_mfcc is not None and int(cached_n_mfcc) != 40:
+        raise ValueError(f"MFCC cache n_mfcc mismatch: cache has {cached_n_mfcc}, train expects 40")
+    if cached_n_mels is not None and int(cached_n_mels) != 64:
+        raise ValueError(f"MFCC cache n_mels mismatch: cache has {cached_n_mels}, train expects 64")
 
 
 def make_model(args: argparse.Namespace) -> nn.Module:
@@ -210,6 +295,77 @@ def make_optimizer(model: nn.Module, args: argparse.Namespace) -> torch.optim.Op
     if not groups:
         raise ValueError("No trainable parameters found.")
     return torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+
+
+RESUME_CONFIG_EXCLUDED_ARGS = {
+    "resume_from",
+    "device",
+    "num_workers",
+    "limit_train",
+    "limit_dev",
+    "limit_per_class",
+}
+
+
+def load_checkpoint(path: Path) -> dict[str, Any]:
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def populate_args_from_checkpoint(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    checkpoint: dict[str, Any],
+) -> None:
+    config = checkpoint.get("config", {})
+    for key, value in config.items():
+        if key in RESUME_CONFIG_EXCLUDED_ARGS or not hasattr(args, key):
+            continue
+        if getattr(args, key) == parser.get_default(key):
+            setattr(args, key, value)
+
+
+def move_state_to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: move_state_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [move_state_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(move_state_to_device(item, device) for item in value)
+    return value
+
+
+def summarize_metric_history(
+    metrics_path: Path,
+    *,
+    best_metric_name: str,
+    current_epoch: int,
+) -> tuple[float, int]:
+    default_best_metric_value = -math.inf if best_metric_name == "roc_auc" else math.inf
+    if not metrics_path.exists():
+        return default_best_metric_value, 0
+
+    best_metric_value = default_best_metric_value
+    epochs_without_improve = 0
+    for line in metrics_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        epoch = int(record.get("epoch", 0))
+        if epoch > current_epoch:
+            break
+        current_metric_value = float(record["dev"][best_metric_name])
+        if best_metric_name == "loss":
+            improved = current_metric_value < best_metric_value
+        else:
+            improved = not math.isnan(current_metric_value) and current_metric_value > best_metric_value
+        if improved:
+            best_metric_value = current_metric_value
+            epochs_without_improve = 0
+        else:
+            epochs_without_improve += 1
+    return best_metric_value, epochs_without_improve
 
 
 def build_scheduler(
@@ -245,12 +401,17 @@ def class_weight_tensor(dataset: ASVspoof5Dataset, device: torch.device) -> torc
 def batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     ssl_features = batch["ssl_features"]
     ssl_lengths = batch["ssl_lengths"]
+    mfcc_features = batch["mfcc_features"]
+    mfcc_lengths = batch["mfcc_lengths"]
+    waveforms = batch["waveforms"]
     return {
-        "waveforms": batch["waveforms"].to(device, non_blocking=True),
+        "waveforms": waveforms.to(device, non_blocking=True) if waveforms is not None else None,
         "lengths": batch["lengths"].to(device, non_blocking=True),
         "labels": batch["labels"].to(device, non_blocking=True),
         "ssl_features": ssl_features.to(device, non_blocking=True) if ssl_features is not None else None,
         "ssl_lengths": ssl_lengths.to(device, non_blocking=True) if ssl_lengths is not None else None,
+        "mfcc_features": mfcc_features.to(device, non_blocking=True) if mfcc_features is not None else None,
+        "mfcc_lengths": mfcc_lengths.to(device, non_blocking=True) if mfcc_lengths is not None else None,
     }
 
 
@@ -277,6 +438,7 @@ def evaluate(
     *,
     use_amp: bool,
     eval_passes: int = 1,
+    desc_prefix: str = "dev",
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -297,7 +459,7 @@ def evaluate(
             pass_labels: list[int] = []
 
             with torch.no_grad():
-                for batch in tqdm(loader, desc=f"dev[{eval_pass + 1}/{eval_passes}]", leave=False):
+                for batch in tqdm(loader, desc=f"{desc_prefix}[{eval_pass + 1}/{eval_passes}]", leave=False):
                     batch_on_device = batch_to_device(batch, device)
                     waveforms = batch_on_device["waveforms"]
                     lengths = batch_on_device["lengths"]
@@ -308,6 +470,8 @@ def evaluate(
                             lengths,
                             ssl_features=batch_on_device["ssl_features"],
                             ssl_feature_lengths=batch_on_device["ssl_lengths"],
+                            mfcc_features=batch_on_device["mfcc_features"],
+                            mfcc_feature_lengths=batch_on_device["mfcc_lengths"],
                         )
                         loss = criterion(logits, targets)
                     batch_size = targets.size(0)
@@ -340,8 +504,11 @@ def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+    scaler: torch.amp.GradScaler,
+    ema: TrainableEMA | None,
     epoch: int,
     best_metric_value: float,
+    epochs_without_improve: int,
     args: argparse.Namespace,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -350,12 +517,61 @@ def save_checkpoint(
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "scaler": scaler.state_dict() if scaler.is_enabled() else None,
+            "ema": ema.state_dict() if ema is not None else None,
             "epoch": epoch,
             "best_metric_value": best_metric_value,
+            "epochs_without_improve": epochs_without_improve,
             "config": vars(args),
         },
         path,
     )
+
+
+def resume_training_state(
+    checkpoint: dict[str, Any],
+    checkpoint_path: Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+    scaler: torch.amp.GradScaler,
+    ema: TrainableEMA | None,
+    device: torch.device,
+    best_metric_name: str,
+) -> tuple[int, float, int]:
+    model.load_state_dict(checkpoint["model"])
+
+    optimizer_state = checkpoint.get("optimizer")
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+        for state in optimizer.state.values():
+            for key, value in list(state.items()):
+                state[key] = move_state_to_device(value, device)
+
+    scheduler_state = checkpoint.get("scheduler")
+    if scheduler is not None and scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
+
+    scaler_state = checkpoint.get("scaler")
+    if scaler.is_enabled() and scaler_state is not None:
+        scaler.load_state_dict(scaler_state)
+
+    if ema is not None:
+        ema.load_state_dict(checkpoint.get("ema"), device)
+
+    current_epoch = int(checkpoint.get("epoch", 0))
+    metrics_path = checkpoint_path.parent / "metrics.jsonl"
+    inferred_best_metric_value, inferred_epochs_without_improve = summarize_metric_history(
+        metrics_path,
+        best_metric_name=best_metric_name,
+        current_epoch=current_epoch,
+    )
+    best_metric_value = float(checkpoint.get("best_metric_value", inferred_best_metric_value))
+    epochs_without_improve = checkpoint.get("epochs_without_improve")
+    if epochs_without_improve is None:
+        epochs_without_improve = inferred_epochs_without_improve
+    return current_epoch + 1, best_metric_value, int(epochs_without_improve)
 
 
 def train_one_epoch(
@@ -388,6 +604,8 @@ def train_one_epoch(
                 lengths,
                 ssl_features=batch_on_device["ssl_features"],
                 ssl_feature_lengths=batch_on_device["ssl_lengths"],
+                mfcc_features=batch_on_device["mfcc_features"],
+                mfcc_feature_lengths=batch_on_device["mfcc_lengths"],
             )
             loss = criterion(logits, targets) / args.grad_accum_steps
 
@@ -433,7 +651,15 @@ def train_one_epoch(
 
 
 def main() -> None:
-    args = parse_args()
+    args, parser = parse_args()
+    resume_path = Path(args.resume_from) if args.resume_from is not None else None
+    resume_checkpoint: dict[str, Any] | None = None
+    if resume_path is not None:
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        resume_checkpoint = load_checkpoint(resume_path)
+        populate_args_from_checkpoint(args, parser, resume_checkpoint)
+
     seed_everything(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -441,12 +667,19 @@ def main() -> None:
     device = torch.device(args.device)
     torch.backends.cudnn.benchmark = device.type == "cuda"
 
+    if resume_path is not None and output_dir.resolve() != resume_path.parent.resolve():
+        print(f"resume note: loading {resume_path} and writing continued checkpoints to {output_dir}")
+    if resume_path is not None and resume_path.name == "best.pt":
+        print("resume note: best.pt is best for evaluation; prefer last.pt when continuing training.")
+
     validate_wav2vec_cache(args)
+    validate_mfcc_cache(args)
     train_dataset, dev_dataset, train_loader, dev_loader = make_loaders(args)
     print(f"train items: {len(train_dataset)} class_counts={dict(train_dataset.class_counts)}")
     print(f"dev items: {len(dev_dataset)} class_counts={dict(dev_dataset.class_counts)}")
     print(f"device: {device}")
     print(f"wav2vec cache: {args.wav2vec_cache_dir if train_dataset.ssl_cache_dir is not None else 'disabled'}")
+    print(f"mfcc cache: {args.mfcc_cache_dir if train_dataset.mfcc_cache_dir is not None else 'disabled'}")
 
     model = make_model(args).to(device)
     optimizer = make_optimizer(model, args)
@@ -457,12 +690,36 @@ def main() -> None:
     use_amp = args.mixed_precision and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
     ema = TrainableEMA(model, args.ema_decay) if args.ema_decay > 0 else None
+    start_epoch = 1
     best_metric_value = -math.inf if args.best_metric == "roc_auc" else math.inf
     epochs_without_improve = 0
+    if resume_checkpoint is not None and resume_path is not None:
+        start_epoch, best_metric_value, epochs_without_improve = resume_training_state(
+            resume_checkpoint,
+            resume_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            ema=ema,
+            device=device,
+            best_metric_name=args.best_metric,
+        )
+        print(
+            f"resumed from {resume_path}: "
+            f"last_epoch={start_epoch - 1} best_{args.best_metric}={best_metric_value:.4f} "
+            f"epochs_without_improve={epochs_without_improve}"
+        )
+        if start_epoch > args.epochs:
+            print(
+                f"checkpoint already reached epoch {start_epoch - 1}, "
+                f"which is >= requested total epochs {args.epochs}; nothing to do."
+            )
+            return
 
     metrics_path = output_dir / "metrics.jsonl"
     with metrics_path.open("a", encoding="utf-8") as metrics_file:
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(start_epoch, args.epochs + 1):
             train_metrics = train_one_epoch(
                 model,
                 train_loader,
@@ -520,8 +777,11 @@ def main() -> None:
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
+                    scaler=scaler,
+                    ema=ema,
                     epoch=epoch,
                     best_metric_value=best_metric_value,
+                    epochs_without_improve=epochs_without_improve,
                     args=args,
                 )
                 if ema is not None:
@@ -534,8 +794,11 @@ def main() -> None:
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
+                scaler=scaler,
+                ema=ema,
                 epoch=epoch,
                 best_metric_value=best_metric_value,
+                epochs_without_improve=epochs_without_improve,
                 args=args,
             )
 

@@ -5,3 +5,5 @@ numpy==2.4.4
 scikit-learn==1.8.0
 soundfile==0.13.1
 tqdm==4.67.3
+matplotlib==3.10.7
+flask==3.1.2

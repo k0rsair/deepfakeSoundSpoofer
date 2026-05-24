@@ -15,6 +15,7 @@ from tqdm.auto import tqdm
 
 from deepfake_spoofer.data import ASVspoof5Dataset, ID_TO_LABEL, collate_audio, load_audio
 from deepfake_spoofer.predict import build_model_from_checkpoint
+from deepfake_spoofer.train import needs_waveforms
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +54,7 @@ def add_shared_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-seconds", type=float, default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--limit-per-class", type=int, default=None)
+    parser.add_argument("--mfcc-cache-dir", default=None)
 
 
 def load_checkpoint_and_model(args: argparse.Namespace) -> tuple[dict[str, Any], torch.nn.Module, torch.device]:
@@ -72,8 +74,21 @@ def dataset_max_seconds(checkpoint: dict[str, Any], requested: float | None) -> 
 def make_loader(args: argparse.Namespace, checkpoint: dict[str, Any], sample_rate: int) -> DataLoader:
     config = checkpoint.get("config", {})
     ssl_cache_dir = None
-    if config.get("freeze_wav2vec") and config.get("model_type", "wav2vec_pyara") in {"fusion", "wav2vec_pyara"}:
+    mfcc_cache_dir = args.mfcc_cache_dir
+    if config.get("freeze_wav2vec") and config.get("model_type", "wav2vec_pyara") in {
+        "fusion",
+        "fusion_temporal",
+        "wav2vec_pyara",
+        "wav2vec_temporal",
+    }:
         ssl_cache_dir = config.get("wav2vec_cache_dir")
+    if mfcc_cache_dir is None and config.get("model_type", "wav2vec_pyara") in {"fusion", "fusion_temporal", "mfcc_resnet"}:
+        mfcc_cache_dir = config.get("mfcc_cache_dir")
+    load_waveform = needs_waveforms(
+        config.get("model_type", "wav2vec_pyara"),
+        ssl_cache_dir=ssl_cache_dir,
+        mfcc_cache_dir=mfcc_cache_dir,
+    )
     dataset = ASVspoof5Dataset(
         args.data_dir,
         args.split,
@@ -83,6 +98,8 @@ def make_loader(args: argparse.Namespace, checkpoint: dict[str, Any], sample_rat
         limit=args.limit,
         limit_per_class=args.limit_per_class,
         ssl_cache_dir=ssl_cache_dir,
+        mfcc_cache_dir=mfcc_cache_dir,
+        load_waveform=load_waveform,
     )
     return DataLoader(
         dataset,
@@ -105,10 +122,19 @@ def extract_embeddings(
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="embeddings", leave=False):
-            waveforms = batch["waveforms"].to(device, non_blocking=True)
+            waveforms = batch["waveforms"].to(device, non_blocking=True) if batch["waveforms"] is not None else None
             lengths = batch["lengths"].to(device, non_blocking=True)
+            mfcc_features = batch["mfcc_features"]
+            mfcc_lengths = batch["mfcc_lengths"]
             targets = batch["labels"].cpu().numpy()
-            embedding, logits = model(waveforms, lengths)
+            embedding, logits = model(
+                waveforms,
+                lengths,
+                ssl_features=batch["ssl_features"].to(device, non_blocking=True) if batch["ssl_features"] is not None else None,
+                ssl_feature_lengths=batch["ssl_lengths"].to(device, non_blocking=True) if batch["ssl_lengths"] is not None else None,
+                mfcc_features=mfcc_features.to(device, non_blocking=True) if mfcc_features is not None else None,
+                mfcc_feature_lengths=mfcc_lengths.to(device, non_blocking=True) if mfcc_lengths is not None else None,
+            )
             embedding = F.normalize(embedding.float(), p=2, dim=1)
             embeddings.append(embedding.cpu().numpy())
             logits_rows.append(logits.float().cpu().numpy())
